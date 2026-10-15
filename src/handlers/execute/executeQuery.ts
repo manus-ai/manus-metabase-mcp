@@ -15,35 +15,145 @@ import { ErrorCode, McpError } from '../../types/core.js';
  * Used when METABASE_READ_ONLY_MODE is enabled.
  */
 export function isReadOnlyQuery(sql: string): boolean {
-  // Normalize the query: trim whitespace and remove leading comments
-  const normalized = sql
-    .trim()
-    // Remove single-line comments
-    .replace(/--.*$/gm, '')
-    // Remove multi-line comments
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .trim()
-    .toUpperCase();
+  // Read-only mode must fail closed. A blacklist misses dialect-specific
+  // mutating commands such as VACUUM, PRAGMA, ATTACH, and COPY.
+  const tokens = tokenizeSql(sql);
+  const semicolonIndex = tokens.indexOf(';');
+  if (semicolonIndex !== -1) {
+    if (semicolonIndex !== tokens.length - 1) {
+      return false;
+    }
+    tokens.pop();
+  }
 
-  // Patterns that indicate write operations
-  const writePatterns = [
-    /^\s*INSERT\b/,
-    /^\s*UPDATE\b/,
-    /^\s*DELETE\b/,
-    /^\s*DROP\b/,
-    /^\s*CREATE\b/,
-    /^\s*ALTER\b/,
-    /^\s*TRUNCATE\b/,
-    /^\s*REPLACE\b/,
-    /^\s*MERGE\b/,
-    /^\s*CALL\b/, // Stored procedures
-    /^\s*EXEC(UTE)?\b/, // Execute statements
-    /^\s*GRANT\b/,
-    /^\s*REVOKE\b/,
-    /^\s*SET\b/, // Can modify session variables
-  ];
+  const firstToken = tokens[0];
+  if (!firstToken) {
+    return false;
+  }
+  if (READ_ONLY_COMMANDS.has(firstToken)) {
+    return true;
+  }
 
-  return !writePatterns.some(pattern => pattern.test(normalized));
+  if (firstToken === 'explain') {
+    const explainedCommand = tokens
+      .slice(1)
+      .find(token => READ_ONLY_COMMANDS.has(token) || WRITE_COMMANDS.has(token));
+    return explainedCommand !== undefined && READ_ONLY_COMMANDS.has(explainedCommand);
+  }
+
+  if (firstToken === 'with') {
+    let depth = 0;
+    for (const token of tokens.slice(1)) {
+      if (token === '(') {
+        depth++;
+      }
+      if (token === ')') {
+        depth--;
+      }
+      if (depth === 0 && (READ_ONLY_COMMANDS.has(token) || WRITE_COMMANDS.has(token))) {
+        return token === 'select';
+      }
+    }
+  }
+
+  return false;
+}
+
+const READ_ONLY_COMMANDS = new Set(['select', 'show', 'describe']);
+const WRITE_COMMANDS = new Set([
+  'insert',
+  'update',
+  'delete',
+  'drop',
+  'create',
+  'alter',
+  'truncate',
+  'replace',
+  'merge',
+  'call',
+  'exec',
+  'execute',
+  'grant',
+  'revoke',
+  'set',
+  'vacuum',
+  'pragma',
+  'attach',
+  'detach',
+  'copy',
+  'do',
+]);
+
+/** Tokenize SQL while ignoring comments and quoted values/identifiers. */
+function tokenizeSql(sql: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let quote = '';
+  let lineComment = false;
+  let blockComment = false;
+  const flush = () => {
+    if (current) {
+      tokens.push(current.toLowerCase());
+      current = '';
+    }
+  };
+
+  for (let i = 0; i < sql.length; i++) {
+    const char = sql[i];
+    const next = sql[i + 1];
+    if (lineComment) {
+      if (char === '\n') {
+        lineComment = false;
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (quote) {
+      if (char === quote && next === quote) {
+        i++;
+      } else if (char === quote) {
+        quote = '';
+      }
+      continue;
+    }
+    if ((char === '-' && next === '-') || char === '#') {
+      flush();
+      lineComment = true;
+      if (char === '-') {
+        i++;
+      }
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      flush();
+      blockComment = true;
+      i++;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === '`') {
+      flush();
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      flush();
+    } else if (char === '(' || char === ')' || char === ';') {
+      flush();
+      tokens.push(char);
+    } else if (/\w/.test(char)) {
+      current += char;
+    } else {
+      flush();
+    }
+  }
+  flush();
+  return tokens;
 }
 
 export async function executeSqlQuery(
