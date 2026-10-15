@@ -1093,6 +1093,22 @@ describe('isReadOnlyQuery', () => {
       expect(isReadOnlyQuery('select * from users')).toBe(true);
       expect(isReadOnlyQuery('Select * From Users')).toBe(true);
     });
+
+    it('should reject unknown SQL commands in read-only mode', () => {
+      expect(isReadOnlyQuery('VACUUM users')).toBe(false);
+      expect(isReadOnlyQuery('PRAGMA user_version')).toBe(false);
+      expect(isReadOnlyQuery("ATTACH DATABASE 'other.db' AS other")).toBe(false);
+    });
+
+    it('should reject mutating statements hidden behind a CTE or EXPLAIN', () => {
+      expect(isReadOnlyQuery('WITH doomed AS (SELECT 1) DELETE FROM users')).toBe(false);
+      expect(isReadOnlyQuery('EXPLAIN DELETE FROM users')).toBe(false);
+    });
+
+    it('should reject multiple statements', () => {
+      expect(isReadOnlyQuery('SELECT * FROM users; DROP TABLE users')).toBe(false);
+      expect(isReadOnlyQuery('SELECT * FROM users;')).toBe(true);
+    });
   });
 
   describe('should return false for write queries', () => {
